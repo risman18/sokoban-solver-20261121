@@ -1,22 +1,11 @@
-// Sokoban solver for make.fun's sokoban-solver-01-run-20261121.
-//
-// Approach: the generator builds each level as a 1-wide hallway plus 1-4
-// rooms off it, one door each; a box pushed out of a room can never return,
-// so every room is an independent push-optimal subproblem and the level
-// optimum is the sum of the room optima. Each room is solved with a
-// push-based A* (player-reachability BFS between pushes, an assignment
-// heuristic over wall-aware distances, and deadlock pruning), then the room
-// solutions are stitched together with plain walks along the hallway.
-//
-// Deterministic: fixed direction order, a counter tie-break in the heap,
-// no clock, no randomness, no environment reads beyond the two directories.
+// Sokoban solver: room decomposition + push-optimal A* per room.
+// Deterministic: fixed direction order, no clock, no randomness.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-// Directions in fixed order: up, down, left, right.
 const DX = [0, 0, -1, 1];
 const DY = [-1, 1, 0, 0];
 const DC = ['u', 'd', 'l', 'r'];
@@ -52,8 +41,6 @@ function parseLevel(text: string): Level {
   return { w, h, wall, goal, boxes, player };
 }
 
-// BFS over cells where pass(c) is true, from `from`. Returns the prev-cell
-// array (-1 unvisited, prev[from] = from) or null when `to` is unreachable.
 function bfsPrev(
   w: number,
   h: number,
@@ -83,7 +70,6 @@ function bfsPrev(
   return prev[to] !== -1 ? prev : null;
 }
 
-// Rebuild the move string from a bfsPrev result.
 function pathFrom(prev: Int32Array, from: number, to: number): string {
   if (from === to) return '';
   let out = '';
@@ -97,9 +83,6 @@ function pathFrom(prev: Int32Array, from: number, to: number): string {
   return out;
 }
 
-// Shortest walk from `from` to `to` avoiding walls and the cells in
-// `blocked` (a Uint8Array); `allow` restricts the walk to a subset of cells
-// when given. Null when unreachable.
 function walk(
   w: number,
   h: number,
@@ -115,8 +98,6 @@ function walk(
   return prev === null ? null : pathFrom(prev, from, to);
 }
 
-// Smallest cell reachable from `from` (canonical player position for a
-// given box layout), over `allow` avoiding `blocked`.
 function canonPlayer(
   w: number,
   h: number,
@@ -147,10 +128,6 @@ function canonPlayer(
   return best;
 }
 
-// Push-optimal A* for one room. `cells` are the room's floor cells (door
-// cell included), `outside` is the hallway cell just outside the door and
-// is walkable by the player only. Returns the move string from `outside`
-// (player starts there) that puts every room box on a room goal, or null.
 function solveRoom(
   w: number,
   h: number,
@@ -165,7 +142,6 @@ function solveRoom(
   for (const c of cells) allow[c] = 1;
   allow[outside] = 1;
   const n = boxes0.length;
-  // The door cell: the room cell touching the hallway cell outside.
   let door = -1;
   {
     const x = outside % w;
@@ -179,9 +155,6 @@ function solveRoom(
     }
   }
 
-  // Wall-aware distance from every cell to each goal (BFS over room floor,
-  // ignoring boxes): a push moves one box one step, so the assignment total
-  // below is an admissible heuristic. Cells no goal reaches are dead.
   const dist: Int32Array[] = [];
   const dead = new Uint8Array(w * h);
   for (const c of cells) dead[c] = 1;
@@ -208,8 +181,6 @@ function solveRoom(
     dist.push(d);
   }
 
-  // Minimum assignment of boxes to goals over the wall-aware distances
-  // (n <= 4, so all permutations). Infinity when no assignment reaches.
   const perms: number[][] = [];
   const used = new Array(n).fill(false);
   const cur: number[] = [];
@@ -246,10 +217,6 @@ function solveRoom(
     return best;
   };
 
-  // Deadlock tests on a box layout (boxMask marks box cells). All are
-  // sound: a flagged layout can never reach all goals. Only walls count as
-  // blockers here: a neighbouring box may still move away, so treating
-  // boxes as walls would prune solvable layouts.
   const deadlocked = (boxes: number[], boxMask: Uint8Array): boolean => {
     const isWall = (c: number): boolean => c < 0 || c >= w * h || wall[c] || !allow[c];
     for (const b of boxes) {
@@ -257,12 +224,9 @@ function solveRoom(
       if (dead[b]) return true;
       const x = b % w;
       const y = (b / w) | 0;
-      // Corner: walls on two perpendicular sides.
       for (const [d1, d2] of [[0, 2], [0, 3], [1, 2], [1, 3]] as const) {
         if (isWall(b + DY[d1] * w + DX[d1]) && isWall(b + DY[d2] * w + DX[d2])) return true;
       }
-      // Frozen against walls alone: no push direction is open even
-      // ignoring the other boxes.
       let movable = false;
       for (let d = 0; d < 4; d++) {
         if (!isWall(b + DY[d] * w + DX[d]) && !isWall(b - DY[d] * w - DX[d])) {
@@ -271,9 +235,6 @@ function solveRoom(
         }
       }
       if (!movable) return true;
-      // 2x2 block of walls/boxes holding a box and no goal: no box in
-      // such a block can ever be pushed first (each push direction has a
-      // wall/box as its target or as the square the player would stand on).
       for (let ox = 0; ox <= 1; ox++) {
         for (let oy = 0; oy <= 1; oy++) {
           const bx = x - ox;
@@ -291,10 +252,6 @@ function solveRoom(
           if (all && !hasGoal) return true;
         }
       }
-      // Along a wall: a box that can only slide along a wall segment whose
-      // both ends are shut (a wall, or the board's edge, beyond each end)
-      // and which holds no goal can never reach a goal. An open end lets
-      // the box slide off the segment, so it is not a deadlock.
       for (let d = 0; d < 4; d++) {
         const wx = x + DX[d];
         const wy = y + DY[d];
@@ -343,8 +300,6 @@ function solveRoom(
   if (!Number.isFinite(h0)) return null;
   nodes.push({ boxes: startBoxes, player: outside, parent: -1, depth: 0, moves: '' });
 
-  // Binary heap of [f, counter, nodeIdx]; the counter keeps ties in
-  // insertion order so the search is fully deterministic.
   const heap: [number, number, number][] = [];
   let counter = 0;
   const heapPush = (f: number, idx: number): void => {
@@ -394,8 +349,6 @@ function solveRoom(
     const node = nodes[idx]!;
     const boxMask = new Uint8Array(w * h);
     for (const b of node.boxes) boxMask[b] = 1;
-    // Goal: every box on a goal and the player can still walk out to the
-    // door (so the finished room never shuts the player in).
     let solved = true;
     for (const b of node.boxes) if (!goal[b]) { solved = false; break; }
     if (solved && door >= 0) {
@@ -412,7 +365,6 @@ function solveRoom(
       }
     }
     if (++expansions > MAX_EXPANSIONS) return null;
-    // Expand: every push of every box the player can reach.
     for (let bi = 0; bi < n; bi++) {
       const b = node.boxes[bi]!;
       for (let d = 0; d < 4; d++) {
@@ -444,13 +396,11 @@ function solveRoom(
   return null;
 }
 
-// Solve one whole level. Returns the move string, or '' when unsolved.
 function solveLevel(text: string): string {
   const { w, h, wall, goal, boxes, player } = parseLevel(text);
   const hallRow = (player / w) | 0;
   const inHall = (c: number): boolean => ((c / w) | 0) === hallRow;
 
-  // Rooms: connected components of floor cells outside the hallway row.
   const seenCell = new Uint8Array(w * h);
   const rooms: { cells: number[]; boxes: number[]; goals: number[]; door: number; outside: number }[] = [];
   for (let c = 0; c < w * h; c++) {
@@ -477,7 +427,6 @@ function solveLevel(text: string): string {
     const rboxes = boxes.filter((b) => cells.includes(b));
     const rgoals = cells.filter((x) => goal[x]);
     if (rboxes.length === 0) continue;
-    // Door candidates: room cells touching a hallway floor cell.
     const doors: { door: number; outside: number }[] = [];
     for (const cell of cells) {
       const x = cell % w;
@@ -492,7 +441,6 @@ function solveLevel(text: string): string {
     }
     doors.sort((a, b) => a.door - b.door);
     rooms.push({ cells, boxes: rboxes, goals: rgoals, door: doors[0]?.door ?? -1, outside: doors[0]?.outside ?? -1 });
-    // Keep every door candidate for the fallback loop in the stitcher.
     (rooms[rooms.length - 1] as unknown as { doors: typeof doors }).doors = doors;
   }
 
@@ -514,7 +462,6 @@ function solveLevel(text: string): string {
       }
     }
     if (roomMoves === null) return '';
-    // Walk along the hallway to this room's door, then play its solution.
     const boxMask = new Uint8Array(w * h);
     for (const b of curBoxes) boxMask[b] = 1;
     const toDoor = walk(w, h, wall, boxMask, curPlayer, usedDoor.outside, null);
@@ -522,8 +469,6 @@ function solveLevel(text: string): string {
     moves += toDoor;
     curPlayer = usedDoor.outside;
     moves += roomMoves;
-    // Simulate the room's moves on the whole level to track the player
-    // and the boxes for the next room's walk.
     for (const ch of roomMoves) {
       const d = DC.indexOf(ch);
       const next = curPlayer + DY[d] * w + DX[d];
@@ -532,7 +477,6 @@ function solveLevel(text: string): string {
       curPlayer = next;
     }
   }
-  // Verify the replay solves the level.
   for (const b of curBoxes) if (!goal[b]) return '';
   return moves;
 }
